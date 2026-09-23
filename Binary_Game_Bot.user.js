@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Binary Game Bot
 // @namespace    https://netacad.sadlab.su/
-// @version      3.9
+// @version      3.10
 // @description  Автоматически проходит Cisco Binary Game
 // @match        https://netacad.sadlab.su/games/binary/*
 // @run-at       document-idle
@@ -382,9 +382,9 @@
 
   function flappyResize() {
     if (!flWin || !flCanvas) return;
-    var top = flScoreBarBottom();
-    flWin.style.top = top + 'px';
-    var w = window.innerWidth, h = window.innerHeight - top;
+    // На ПК сохраняем компактное игровое поле по центру, на телефоне — всю ширину.
+    var w = Math.min(window.innerWidth, 560);
+    var h = window.innerHeight;
     if (flCanvas.width !== w || flCanvas.height !== h) {
       flCanvas.width = w;
       flCanvas.height = h;
@@ -633,9 +633,12 @@
 
   function buildFlappy() {
     flWin = document.createElement('div');
-    flWin.style.cssText = 'position:fixed;left:0;right:0;bottom:0;top:0;z-index:2147483640;display:none;';
+    flWin.style.cssText = 'position:fixed;inset:0;z-index:2147483640;display:none;' +
+      'background:#0a1a30;overflow:hidden;';
     flCanvas = document.createElement('canvas');
-    flCanvas.style.cssText = 'display:block;width:100%;height:100%;cursor:pointer;touch-action:none;';
+    flCanvas.style.cssText = 'display:block;width:100%;max-width:560px;height:100%;' +
+      'margin:0 auto;cursor:pointer;touch-action:none;' +
+      'box-shadow:0 0 80px rgba(0,0,0,.55);';
     flCtx = flCanvas.getContext('2d');
     flCanvas.addEventListener('pointerdown', function (e) {
       e.preventDefault();

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Binary Game Bot
 // @namespace    https://netacad.sadlab.su/
-// @version      3.14
+// @version      3.15
 // @description  Автоматически проходит Cisco Binary Game
 // @match        https://netacad.sadlab.su/games/binary/*
 // @run-at       document-idle
@@ -15,6 +15,27 @@
   // Задержка выбирается автоматически по фактической стоимости решения.
   var FARM_DELAY = 12;
   var solveCostEma = 0, nextFarmAt = 0;
+  var fastBatchTimer = null, fastBatchStage = null, fastBatchQueuedAt = 0;
+  function cancelFastBatch() {
+    if (fastBatchTimer !== null) clearTimeout(fastBatchTimer);
+    fastBatchTimer = null; fastBatchStage = null;
+  }
+  function scheduleFastBatch(stage) {
+    if (fastBatchTimer !== null) return;
+    fastBatchStage = stage;
+    fastBatchQueuedAt = Date.now();
+    // Для автофарма не создаём тяжёлую Redux-очередь на каждую тройку задач.
+    fastBatchTimer = setTimeout(function () {
+      fastBatchTimer = null;
+      if (!running || !store) return;
+      var g = store.getState().game;
+      if (g.stage !== fastBatchStage || g.isGameOver || g.isIntro || g.isTutorial ||
+          g.activeProblems.length || g.problemsCompleted >= linesRequired(g.stage)) return;
+      logFarm('fast-batch', { stage: g.stage, waitMs: Date.now() - fastBatchQueuedAt });
+      beginStage();
+      scheduleFarmTick();
+    }, automaticDelay());
+  }
   var HINT_OPACITY = Math.max(0, Math.min(100, Number(localStorage.getItem('blxckHintOpacity') ?? 45)));
   /* default */ // /* Прозрачность подсказки 💡 в процентах: 0 — невидимая, 100 — яркая */
   /* ============================================= */
@@ -93,6 +114,7 @@
       pending: Object.keys(pending), paused: !!time.isPaused,
       modal: modal, visible: document.visibilityState, running: running,
       solved: farmStats.solved, ticks: farmTicks, delay: FARM_DELAY,
+      fastBatchPending: fastBatchTimer !== null,
       profile: { solves: profile.solves, avgSolveMs: profile.solves ? Math.round(profile.solveMs / profile.solves * 10) / 10 : 0,
         avgGuessMs: profile.solves ? Math.round(profile.guessMs / profile.solves * 10) / 10 : 0,
         avgTickMs: profile.ticks ? Math.round(profile.tickMs / profile.ticks * 10) / 10 : 0,
@@ -114,7 +136,7 @@
   function exportFarmLog() {
     farmSnapshot('export');
     logFarm('profile-current', Object.assign({}, profile));
-    var payload = { format: 'binary-game-bot-diagnostic', version: '3.14',
+    var payload = { format: 'binary-game-bot-diagnostic', version: '3.15',
       exported: new Date().toISOString(), pageVisibility: document.visibilityState,
       stats: farmStats, profile: profile, events: diagnostic.events };
     var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
@@ -182,7 +204,9 @@
     store.dispatch(addProblemThunk());
     store.dispatch(addProblemThunk());
     store.dispatch(addProblemThunk());
-    queue({ id: 'add-problem', repeat: true, action: addProblemThunk(), delay: secs * 1000 });
+    // Резервную генерацию обеспечивает watchdog: не заводим повторяющийся
+    // шестисекундный таймер после каждой партии из трёх задач.
+    if (!running) queue({ id: 'add-problem', repeat: true, action: addProblemThunk(), delay: secs * 1000 });
   }
   function goToIntroStage(stage) {
     store.dispatch({ type: 'GO_TO_INTRO_STAGE', payload: stage });
@@ -195,6 +219,7 @@
     }
   }
   function resetBoard() {
+    cancelFastBatch();
     store.dispatch({ type: 'CLEAR_PENDING_ACTION', payload: 'add-problem' });
     store.dispatch({ type: 'CLEAR_PENDING_ACTION', payload: 'warning-sound' });
     store.dispatch({ type: 'RESET_BOARD' });
@@ -221,11 +246,11 @@
         }
       } else {
         measuredDispatch({ type: 'BOARD_CLEAR' });
-        measuredDispatch({ type: 'SHOW_TOAST', payload: 'Board Clear!' });
-        queue({ id: 'toast-disappear', action: { type: 'HIDE_TOAST' }, delay: 2000 });
+        // Во время скоростного фарма не обновляем всплывающий тост на каждой
+        // партии: на поздних уровнях это тысячи лишних Redux-действий.
         if (g.problemsCompleted < linesRequired(g.stage)) {
           FARM_DELAY = automaticDelay();
-          queue({ id: 'add-problem', action: function () { beginStage(); }, delay: FARM_DELAY });
+          scheduleFastBatch(g.stage);
         }
       }
     }
@@ -871,14 +896,15 @@
       var pendingNow = store.getState().time.pendingActions;
       if (!g.isIntro && !g.isGameOver && g.activeProblems.length === 0 &&
           g.problemsCompleted < linesRequired(g.stage)) {
-        if ('add-problem' in pendingNow) {
-          // Приостановленные фоновые таймеры игры не должны блокировать очередь.
+        if (fastBatchTimer !== null) {
+          // Ожидаем запланированную короткую паузу между партиями.
+        } else if ('add-problem' in pendingNow) {
           tryExecute('add-problem');
         } else if (!farmStageStart) farmStageStart = Date.now();
-        else if (Date.now() - farmStageStart > 600) {
+        else if (Date.now() - farmStageStart > 500) {
           farmStageStart = 0;
           logFarm('board-recovery', { stage: g.stage, completed: g.problemsCompleted });
-          beginStage();
+          scheduleFastBatch(g.stage);
         }
       } else farmStageStart = 0;
       if (signature === lastFarmSignature) return;
@@ -1137,6 +1163,7 @@
       toggleBtn.style.background = running ? '#b8860b' : '#2a7d2a';
       status.textContent = running ? 'бот' : '⏸';
       status.style.color = running ? '#8f8' : '#fa0';
+      if (!running) cancelFastBatch();
       logFarm(running ? 'resume' : 'pause', { stage: store && store.getState().game.stage });
       if (running && store) {
         var now = Date.now();
@@ -1287,6 +1314,7 @@
   function destroy() {
     closeSettingsPopup();
     running = false;
+    cancelFastBatch();
     if (timer) clearInterval(timer);
     delete window.__binaryBotExportLog;
     if (farmWorker) { farmWorker.postMessage('stop'); farmWorker.terminate(); farmWorker = null; }

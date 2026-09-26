@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Binary Game Bot
 // @namespace    https://netacad.sadlab.su/
-// @version      3.12
+// @version      3.13
 // @description  Автоматически проходит Cisco Binary Game
 // @match        https://netacad.sadlab.su/games/binary/*
 // @run-at       document-idle
@@ -55,6 +55,52 @@
   var lastModalAttempt = 0, farmTicks = 0, farmStageStart = 0;
   var farmStats = { started: 0, stage: null, stageTime: 0, levels: 0, solved: 0, lastSolved: 0, lastTick: 0, longestGap: 0, waitingSince: 0, waitingMs: 0, lastStats: 0 };
   var statsEl = null;
+  var diagnostic = { started: 0, events: [], lastSample: 0, lastStage: null, lastProblems: null, lastPending: null, lastModal: null, lastVisibility: null, lastGapReport: 0, lastError: '' };
+  function logFarm(type, data) {
+    if (!diagnostic.started) diagnostic.started = Date.now();
+    diagnostic.events.push(Object.assign({ t: Date.now() - diagnostic.started, type: type }, data || {}));
+    if (diagnostic.events.length > 12000) diagnostic.events.splice(0, diagnostic.events.length - 12000);
+  }
+  function farmSnapshot(reason) {
+    if (!store) return;
+    var st = store.getState(), g = st.game, time = st.time || {};
+    var pending = time.pendingActions || {};
+    var modal = !!document.querySelector('.modal-container.displayed');
+    var now = Date.now();
+    var row = { stage: g.stage, score: g.score, completed: g.problemsCompleted,
+      required: linesRequired(g.stage), problems: g.activeProblems.length,
+      unsolved: g.activeProblems.filter(function (p) { return p.currentGuess !== p.answer; }).length,
+      pending: Object.keys(pending), paused: !!time.isPaused,
+      modal: modal, visible: document.visibilityState, running: running,
+      solved: farmStats.solved, ticks: farmTicks, delay: FARM_DELAY };
+    if (reason || now - diagnostic.lastSample >= 5000 || row.stage !== diagnostic.lastStage ||
+        row.problems !== diagnostic.lastProblems || row.modal !== diagnostic.lastModal ||
+        row.visible !== diagnostic.lastVisibility) {
+      if (reason || row.stage !== diagnostic.lastStage || now - diagnostic.lastSample >= 5000 ||
+          row.modal !== diagnostic.lastModal || row.visible !== diagnostic.lastVisibility) {
+        logFarm(reason || 'sample', row);
+        diagnostic.lastSample = now;
+      }
+      diagnostic.lastStage = row.stage;
+      diagnostic.lastProblems = row.problems;
+      diagnostic.lastModal = row.modal;
+      diagnostic.lastVisibility = row.visible;
+    }
+  }
+  function exportFarmLog() {
+    farmSnapshot('export');
+    var payload = { format: 'binary-game-bot-diagnostic', version: '3.13',
+      exported: new Date().toISOString(), pageVisibility: document.visibilityState,
+      stats: farmStats, events: diagnostic.events };
+    var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'binary-farm-log-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 30000);
+  }
+  window.__binaryBotExportLog = exportFarmLog;
   var panel = null, dot = null, status = null, toggleBtn = null, goalBtn = null;
   var hintOn = false, hintEl = null;
   var goalScore = 0;
@@ -70,6 +116,7 @@
     if (store.getState().time.pendingActions[action.id]) {
       store.dispatch({ type: 'CLEAR_PENDING_ACTION', payload: action.id });
     }
+    if (action.id === 'add-problem') logFarm('queue', { id: action.id, delay: action.delay, repeat: !!action.repeat });
     store.dispatch({ type: 'QUEUE_ACTION', payload: action });
     setTimeout(function () { tryExecute(action.id); scheduleFarmTick(); }, action.delay);
   }
@@ -85,6 +132,7 @@
           delete na.scheduledTime;
           queue(na);
         }
+        if (actionID === 'add-problem') logFarm('queue-execute', { id: actionID, lateMs: Math.round(st.time.now - a.scheduledTime) });
         store.dispatch(a.action);
       }
     }
@@ -103,6 +151,7 @@
   }
   function beginStage() {
     var g = store.getState().game;
+    logFarm('begin-stage', { stage: g.stage, completed: g.problemsCompleted });
     if (g.isIntro) { goToIntroStage('binary'); return; }
     var secs = Math.max((6.2 - g.stage * 0.8) * 2, 6);
     store.dispatch(addProblemThunk());
@@ -728,12 +777,20 @@
       }
       var now0 = Date.now();
       if (!farmStats.started) { farmStats.started = now0; farmStats.stage = g0.stage; farmStats.stageTime = now0; }
-      if (farmStats.lastTick) farmStats.longestGap = Math.max(farmStats.longestGap, now0 - farmStats.lastTick);
+      if (farmStats.lastTick) {
+        var gap = now0 - farmStats.lastTick;
+        farmStats.longestGap = Math.max(farmStats.longestGap, gap);
+        if (gap > 1500 && now0 - diagnostic.lastGapReport > 1000) {
+          diagnostic.lastGapReport = now0;
+          logFarm('timer-gap', { ms: gap, visible: document.visibilityState });
+        }
+      }
       farmStats.lastTick = now0;
       if (typeof g0.stage === 'number' && g0.stage > farmStats.stage) {
         farmStats.levels += g0.stage - farmStats.stage;
         farmStats.stage = g0.stage;
         farmStats.stageTime = now0;
+        logFarm('level-up', { stage: g0.stage, levels: farmStats.levels, solved: farmStats.solved });
       } else if (typeof g0.stage === 'number' && g0.stage < farmStats.stage) {
         farmStats.stage = g0.stage;
         farmStats.stageTime = now0;
@@ -746,6 +803,7 @@
         statsEl.textContent = 'Ур. ' + g0.stage + ' · ' + perHour + ' ур/ч · ' + idle + ' с без ответа';
         statsEl.title = 'Решено: ' + farmStats.solved + '; ожидание: ' + Math.round(farmStats.waitingMs / 1000) + ' с; максимальный разрыв проверок: ' + Math.round(farmStats.longestGap / 1000) + ' с';
       }
+      farmSnapshot();
       if (!rateStamp) rateStamp = { t: now0, s: g0.score };
       if (now0 - rateStamp.t >= 3000 && !g0.isGameOver) {
         var rate = Math.round((g0.score - rateStamp.s) / (now0 - rateStamp.t) * 60000);
@@ -780,6 +838,7 @@
         } else if (!farmStageStart) farmStageStart = Date.now();
         else if (Date.now() - farmStageStart > 600) {
           farmStageStart = 0;
+          logFarm('board-recovery', { stage: g.stage, completed: g.problemsCompleted });
           beginStage();
         }
       } else farmStageStart = 0;
@@ -801,10 +860,19 @@
       } else emptyTicks = 0;
       farmTicks++;
     } catch (e) {
-      if (Date.now() - lastFarmError > 5000) { console.log('bot error', e); lastFarmError = Date.now(); }
+      if (Date.now() - lastFarmError > 5000) {
+        logFarm('error', { message: String(e && e.message || e).slice(0, 300) });
+        console.log('bot error', e); lastFarmError = Date.now();
+      }
     } finally { tickBusy = false; }
   }
   function startLoop() {
+    // Повторное изменение задержки не должно плодить подписки и Worker.
+    if (timer) { clearInterval(timer); timer = null; }
+    if (farmWorker) { farmWorker.terminate(); farmWorker = null; }
+    if (unsubscribeFarm) { unsubscribeFarm(); unsubscribeFarm = null; }
+    if (modalObserver) { modalObserver.disconnect(); modalObserver = null; }
+    document.removeEventListener('visibilitychange', scheduleFarmTick);
     if (typeof store.subscribe === 'function') {
       unsubscribeFarm = store.subscribe(function () {
         if (running) scheduleFarmTick();
@@ -960,7 +1028,8 @@
     showSettingsPopup(toggleBtn, 'Задержка автофарма', FARM_DELAY, 5, 1000, 5, ' мс', function (v) {
       FARM_DELAY = v;
       localStorage.setItem('blxckFarmDelay', String(v));
-      if (timer) { clearInterval(timer); timer = null; startLoop(); }
+      logFarm('delay-change', { delay: v });
+      if (timer) startLoop();
     });
   }
   function showHintSettings(button) {
@@ -1023,6 +1092,9 @@
     flappyBtn = mkBtn('🎮', '#555');
     var hideBtn = mkBtn('—', '#555');
     var killBtn = mkBtn('✕', '#c00');
+    var logBtn = mkBtn('📋 Лог', '#345');
+    logBtn.title = 'Сохранить диагностический JSON для анализа скорости';
+    logBtn.onclick = exportFarmLog;
 
     toggleBtn.onclick = function () {
       running = !running;
@@ -1030,6 +1102,7 @@
       toggleBtn.style.background = running ? '#b8860b' : '#2a7d2a';
       status.textContent = running ? 'бот' : '⏸';
       status.style.color = running ? '#8f8' : '#fa0';
+      logFarm(running ? 'resume' : 'pause', { stage: store && store.getState().game.stage });
       if (running && store) {
         var now = Date.now();
         rateStamp = { t: now, s: store.getState().game.score };
@@ -1165,6 +1238,7 @@
     makeDraggable(eggEl, eggEl);
 
     panel.appendChild(statsEl);
+    panel.appendChild(logBtn);
     document.body.appendChild(panel);
     document.body.appendChild(dot);
 
@@ -1177,6 +1251,7 @@
     closeSettingsPopup();
     running = false;
     if (timer) clearInterval(timer);
+    delete window.__binaryBotExportLog;
     if (farmWorker) { farmWorker.postMessage('stop'); farmWorker.terminate(); farmWorker = null; }
     if (unsubscribeFarm) { unsubscribeFarm(); unsubscribeFarm = null; }
     if (modalObserver) { modalObserver.disconnect(); modalObserver = null; }

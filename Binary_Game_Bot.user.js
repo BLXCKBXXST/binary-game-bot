@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Binary Game Bot
 // @namespace    https://netacad.sadlab.su/
-// @version      3.13
+// @version      3.14
 // @description  Автоматически проходит Cisco Binary Game
 // @match        https://netacad.sadlab.su/games/binary/*
 // @run-at       document-idle
@@ -12,7 +12,9 @@
 
 (function () {
   /* ================= НАСТРОЙКИ ================= */
-  var FARM_DELAY = Math.max(5, Math.min(1000, Number(localStorage.getItem('blxckFarmDelay')) || 25));
+  // Задержка выбирается автоматически по фактической стоимости решения.
+  var FARM_DELAY = 12;
+  var solveCostEma = 0, nextFarmAt = 0;
   var HINT_OPACITY = Math.max(0, Math.min(100, Number(localStorage.getItem('blxckHintOpacity') ?? 45)));
   /* default */ // /* Прозрачность подсказки 💡 в процентах: 0 — невидимая, 100 — яркая */
   /* ============================================= */
@@ -55,6 +57,24 @@
   var lastModalAttempt = 0, farmTicks = 0, farmStageStart = 0;
   var farmStats = { started: 0, stage: null, stageTime: 0, levels: 0, solved: 0, lastSolved: 0, lastTick: 0, longestGap: 0, waitingSince: 0, waitingMs: 0, lastStats: 0 };
   var statsEl = null;
+  var profile = { stage: null, solves: 0, solveMs: 0, maxSolveMs: 0, guessMs: 0, warningMs: 0, boardMs: 0, queueMs: 0, tickMs: 0, maxTickMs: 0, ticks: 0, dispatches: 0, maxDispatchMs: 0, slowDispatches: 0 };
+  function profileReset(stage) {
+    if (profile.stage !== null && profile.solves) logFarm('profile-stage', Object.assign({}, profile));
+    profile = { stage: stage, solves: 0, solveMs: 0, maxSolveMs: 0, guessMs: 0, warningMs: 0, boardMs: 0, queueMs: 0, tickMs: 0, maxTickMs: 0, ticks: 0, dispatches: 0, maxDispatchMs: 0, slowDispatches: 0 };
+  }
+  function measuredDispatch(action) {
+    var t = performance.now();
+    var result = store.dispatch(action);
+    var ms = performance.now() - t;
+    profile.dispatches++;
+    profile.maxDispatchMs = Math.max(profile.maxDispatchMs, ms);
+    if (ms > 25) profile.slowDispatches++;
+    return result;
+  }
+  function automaticDelay() {
+    // Очередь не ускоряется при бесконечном снижении таймера: ориентируемся на стоимость Redux.
+    return Math.max(8, Math.min(80, Math.round(solveCostEma * 0.35) || 12));
+  }
   var diagnostic = { started: 0, events: [], lastSample: 0, lastStage: null, lastProblems: null, lastPending: null, lastModal: null, lastVisibility: null, lastGapReport: 0, lastError: '' };
   function logFarm(type, data) {
     if (!diagnostic.started) diagnostic.started = Date.now();
@@ -72,7 +92,11 @@
       unsolved: g.activeProblems.filter(function (p) { return p.currentGuess !== p.answer; }).length,
       pending: Object.keys(pending), paused: !!time.isPaused,
       modal: modal, visible: document.visibilityState, running: running,
-      solved: farmStats.solved, ticks: farmTicks, delay: FARM_DELAY };
+      solved: farmStats.solved, ticks: farmTicks, delay: FARM_DELAY,
+      profile: { solves: profile.solves, avgSolveMs: profile.solves ? Math.round(profile.solveMs / profile.solves * 10) / 10 : 0,
+        avgGuessMs: profile.solves ? Math.round(profile.guessMs / profile.solves * 10) / 10 : 0,
+        avgTickMs: profile.ticks ? Math.round(profile.tickMs / profile.ticks * 10) / 10 : 0,
+        maxDispatchMs: Math.round(profile.maxDispatchMs), slowDispatches: profile.slowDispatches } };
     if (reason || now - diagnostic.lastSample >= 5000 || row.stage !== diagnostic.lastStage ||
         row.problems !== diagnostic.lastProblems || row.modal !== diagnostic.lastModal ||
         row.visible !== diagnostic.lastVisibility) {
@@ -89,9 +113,10 @@
   }
   function exportFarmLog() {
     farmSnapshot('export');
-    var payload = { format: 'binary-game-bot-diagnostic', version: '3.13',
+    logFarm('profile-current', Object.assign({}, profile));
+    var payload = { format: 'binary-game-bot-diagnostic', version: '3.14',
       exported: new Date().toISOString(), pageVisibility: document.visibilityState,
-      stats: farmStats, events: diagnostic.events };
+      stats: farmStats, profile: profile, events: diagnostic.events };
     var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     var url = URL.createObjectURL(blob);
     var a = document.createElement('a');
@@ -117,7 +142,7 @@
       store.dispatch({ type: 'CLEAR_PENDING_ACTION', payload: action.id });
     }
     if (action.id === 'add-problem') logFarm('queue', { id: action.id, delay: action.delay, repeat: !!action.repeat });
-    store.dispatch({ type: 'QUEUE_ACTION', payload: action });
+    measuredDispatch({ type: 'QUEUE_ACTION', payload: action });
     setTimeout(function () { tryExecute(action.id); scheduleFarmTick(); }, action.delay);
   }
   function tryExecute(actionID) {
@@ -177,29 +202,41 @@
 
   /* ---------- 4. Решение задачи = реплика changeProblemGuess ---------- */
   function solve(problem) {
-    store.dispatch({ type: 'CHANGE_PROBLEM_GUESS', payload: { id: problem.id, guess: problem.answer } });
+    var started = performance.now(), t = started;
+    measuredDispatch({ type: 'CHANGE_PROBLEM_GUESS', payload: { id: problem.id, guess: problem.answer } });
+    profile.guessMs += performance.now() - t;
     var g = store.getState().game;
-    if (g.activeProblems.length < MAX_PROBLEMS) {
-      store.dispatch({ type: 'CLEAR_PENDING_ACTION', payload: 'warning-sound' });
+    t = performance.now();
+    if (g.activeProblems.length < MAX_PROBLEMS && store.getState().time.pendingActions['warning-sound']) {
+      measuredDispatch({ type: 'CLEAR_PENDING_ACTION', payload: 'warning-sound' });
     }
+    profile.warningMs += performance.now() - t;
+    t = performance.now();
     if (g.activeProblems.length === 0) {
       if (g.isIntro) {
         if (g.introStage === 'binary') goToIntroStage('decimal');
         else if (g.introStage === 'decimal') {
-          store.dispatch({ type: 'COMPLETE_INTRO' });
+          measuredDispatch({ type: 'COMPLETE_INTRO' });
           beginStage();
         }
       } else {
-        store.dispatch({ type: 'BOARD_CLEAR' });
-        store.dispatch({ type: 'SHOW_TOAST', payload: 'Board Clear!' });
+        measuredDispatch({ type: 'BOARD_CLEAR' });
+        measuredDispatch({ type: 'SHOW_TOAST', payload: 'Board Clear!' });
         queue({ id: 'toast-disappear', action: { type: 'HIDE_TOAST' }, delay: 2000 });
         if (g.problemsCompleted < linesRequired(g.stage)) {
+          FARM_DELAY = automaticDelay();
           queue({ id: 'add-problem', action: function () { beginStage(); }, delay: FARM_DELAY });
         }
       }
     }
     g = store.getState().game;
     if (g.problemsCompleted >= linesRequired(g.stage)) resetBoard();
+    profile.boardMs += performance.now() - t;
+    var elapsed = performance.now() - started;
+    profile.solves++;
+    profile.solveMs += elapsed;
+    profile.maxSolveMs = Math.max(profile.maxSolveMs, elapsed);
+    solveCostEma = solveCostEma ? solveCostEma * 0.9 + elapsed * 0.1 : elapsed;
     farmStats.solved++;
     farmStats.lastSolved = Date.now();
   }
@@ -763,6 +800,7 @@
     tickBusy = true;
     try {
       if (hintOn && document.visibilityState === 'visible') updateHint();
+      var tickStart = performance.now();
       var g0 = store.getState().game;
       if (g0.isGameOver && (goalScore || goalDone)) {
         goalScore = 0;
@@ -790,6 +828,7 @@
         farmStats.levels += g0.stage - farmStats.stage;
         farmStats.stage = g0.stage;
         farmStats.stageTime = now0;
+        profileReset(g0.stage);
         logFarm('level-up', { stage: g0.stage, levels: farmStats.levels, solved: farmStats.solved });
       } else if (typeof g0.stage === 'number' && g0.stage < farmStats.stage) {
         farmStats.stage = g0.stage;
@@ -801,7 +840,7 @@
         var perHour = Math.round(farmStats.levels / hours);
         var idle = farmStats.lastSolved ? Math.round((now0 - farmStats.lastSolved) / 1000) : 0;
         statsEl.textContent = 'Ур. ' + g0.stage + ' · ' + perHour + ' ур/ч · ' + idle + ' с без ответа';
-        statsEl.title = 'Решено: ' + farmStats.solved + '; ожидание: ' + Math.round(farmStats.waitingMs / 1000) + ' с; максимальный разрыв проверок: ' + Math.round(farmStats.longestGap / 1000) + ' с';
+        statsEl.title = 'Решено: ' + farmStats.solved + '; ожидание: ' + Math.round(farmStats.waitingMs / 1000) + ' с; максимальный разрыв проверок: ' + Math.round(farmStats.longestGap / 1000) + ' с; среднее решение: ' + (profile.solves ? (profile.solveMs / profile.solves).toFixed(1) : '0') + ' мс; автоинтервал: ' + FARM_DELAY + ' мс';
       }
       farmSnapshot();
       if (!rateStamp) rateStamp = { t: now0, s: g0.score };
@@ -864,7 +903,11 @@
         logFarm('error', { message: String(e && e.message || e).slice(0, 300) });
         console.log('bot error', e); lastFarmError = Date.now();
       }
-    } finally { tickBusy = false; }
+    } finally {
+      var tickMs = performance.now() - tickStart;
+      if (tickStart) { profile.ticks++; profile.tickMs += tickMs; profile.maxTickMs = Math.max(profile.maxTickMs, tickMs); }
+      tickBusy = false;
+    }
   }
   function startLoop() {
     // Повторное изменение задержки не должно плодить подписки и Worker.
@@ -1024,14 +1067,6 @@
     };
     document.addEventListener('pointerdown', popupOutside, true);
   }
-  function showDelaySettings() {
-    showSettingsPopup(toggleBtn, 'Задержка автофарма', FARM_DELAY, 5, 1000, 5, ' мс', function (v) {
-      FARM_DELAY = v;
-      localStorage.setItem('blxckFarmDelay', String(v));
-      logFarm('delay-change', { delay: v });
-      if (timer) startLoop();
-    });
-  }
   function showHintSettings(button) {
     showSettingsPopup(button, 'Прозрачность подсказки', HINT_OPACITY, 0, 100, 5, '%', function (v) {
       HINT_OPACITY = v;
@@ -1108,9 +1143,11 @@
         rateStamp = { t: now, s: store.getState().game.score };
         farmStats = { started: now, stage: store.getState().game.stage, stageTime: now, levels: 0, solved: 0, lastSolved: now, lastTick: 0, longestGap: 0, waitingSince: 0, waitingMs: 0, lastStats: 0 };
         lastFarmSignature = '';
+        profileReset(store.getState().game.stage);
+        FARM_DELAY = automaticDelay();
         scheduleFarmTick();
       }
-      if (running) showDelaySettings(); else closeSettingsPopup();
+      closeSettingsPopup();
     };
     goalBtn.onclick = function () {
       var v = window.prompt('На каком счёте закончить игру? Очки начисляются порциями и кратны 25 (на 1 уровне — сотнями), поэтому бот остановится на ближайшем значении НЕ ВЫШЕ цели и даст игре завершиться — рекорд запишется. (0 — без цели)', goalScore || '');

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Binary Game Bot
 // @namespace    https://netacad.sadlab.su/
-// @version      3.11
+// @version      3.12
 // @description  Автоматически проходит Cisco Binary Game
 // @match        https://netacad.sadlab.su/games/binary/*
 // @run-at       document-idle
@@ -53,6 +53,8 @@
   var timer = null, farmWorker = null, unsubscribeFarm = null, modalObserver = null;
   var tickQueued = false, tickBusy = false, lastFarmSignature = '', lastFarmError = 0;
   var lastModalAttempt = 0, farmTicks = 0, farmStageStart = 0;
+  var farmStats = { started: 0, stage: null, stageTime: 0, levels: 0, solved: 0, lastSolved: 0, lastTick: 0, longestGap: 0, waitingSince: 0, waitingMs: 0, lastStats: 0 };
+  var statsEl = null;
   var panel = null, dot = null, status = null, toggleBtn = null, goalBtn = null;
   var hintOn = false, hintEl = null;
   var goalScore = 0;
@@ -64,6 +66,10 @@
 
   /* ---------- 2. Точная реплика таймерной очереди игры ---------- */
   function queue(action) {
+    // Не плодим одинаковые игровые таймеры после восстановления вкладки.
+    if (store.getState().time.pendingActions[action.id]) {
+      store.dispatch({ type: 'CLEAR_PENDING_ACTION', payload: action.id });
+    }
     store.dispatch({ type: 'QUEUE_ACTION', payload: action });
     setTimeout(function () { tryExecute(action.id); scheduleFarmTick(); }, action.delay);
   }
@@ -145,6 +151,8 @@
     }
     g = store.getState().game;
     if (g.problemsCompleted >= linesRequired(g.stage)) resetBoard();
+    farmStats.solved++;
+    farmStats.lastSolved = Date.now();
   }
 
   /* ---------- 4б. Подсказка: ответ для самой нижней строки ---------- */
@@ -719,6 +727,25 @@
         return;
       }
       var now0 = Date.now();
+      if (!farmStats.started) { farmStats.started = now0; farmStats.stage = g0.stage; farmStats.stageTime = now0; }
+      if (farmStats.lastTick) farmStats.longestGap = Math.max(farmStats.longestGap, now0 - farmStats.lastTick);
+      farmStats.lastTick = now0;
+      if (typeof g0.stage === 'number' && g0.stage > farmStats.stage) {
+        farmStats.levels += g0.stage - farmStats.stage;
+        farmStats.stage = g0.stage;
+        farmStats.stageTime = now0;
+      } else if (typeof g0.stage === 'number' && g0.stage < farmStats.stage) {
+        farmStats.stage = g0.stage;
+        farmStats.stageTime = now0;
+      }
+      if (statsEl && now0 - farmStats.lastStats > 2000) {
+        farmStats.lastStats = now0;
+        var hours = Math.max((now0 - farmStats.started) / 3600000, 1 / 3600);
+        var perHour = Math.round(farmStats.levels / hours);
+        var idle = farmStats.lastSolved ? Math.round((now0 - farmStats.lastSolved) / 1000) : 0;
+        statsEl.textContent = 'Ур. ' + g0.stage + ' · ' + perHour + ' ур/ч · ' + idle + ' с без ответа';
+        statsEl.title = 'Решено: ' + farmStats.solved + '; ожидание: ' + Math.round(farmStats.waitingMs / 1000) + ' с; максимальный разрыв проверок: ' + Math.round(farmStats.longestGap / 1000) + ' с';
+      }
       if (!rateStamp) rateStamp = { t: now0, s: g0.score };
       if (now0 - rateStamp.t >= 3000 && !g0.isGameOver) {
         var rate = Math.round((g0.score - rateStamp.s) / (now0 - rateStamp.t) * 60000);
@@ -733,6 +760,12 @@
       if (document.querySelector('.modal-container.displayed')) return;
       var g = store.getState().game;
       if (g.isGameOver || g.isTutorial) return;
+      if (g.activeProblems.length === 0) {
+        if (!farmStats.waitingSince) farmStats.waitingSince = now0;
+      } else if (farmStats.waitingSince) {
+        farmStats.waitingMs += now0 - farmStats.waitingSince;
+        farmStats.waitingSince = 0;
+      }
       // Не перезапускаем решение на каждое внутреннее Redux-действие.
       var signature = g.stage + ':' + g.problemsCompleted + ':' + g.activeProblems.map(function (p) {
         return p.id + '=' + p.currentGuess + '/' + p.answer;
@@ -791,8 +824,24 @@
       if (running) farmTick();
       else if (hintOn && document.visibilityState === 'visible') updateHint();
     }, 250);
-    modalObserver = new MutationObserver(function () {
-      if (running) scheduleFarmTick();
+    modalObserver = new MutationObserver(function (records) {
+      if (!running) return;
+      // Изменения игрового поля обрабатывает Redux; DOM нужен только для модальных окон.
+      for (var i = 0; i < records.length; i++) {
+        var target = records[i].target;
+        if (target && target.closest && target.closest('.modal-container')) {
+          scheduleFarmTick();
+          break;
+        }
+        var added = records[i].addedNodes;
+        for (var j = 0; j < added.length; j++) {
+          var node = added[j];
+          if (node.nodeType === 1 && (node.matches('.modal-container') || node.querySelector('.modal-container'))) {
+            scheduleFarmTick();
+            return;
+          }
+        }
+      }
     });
     modalObserver.observe(document.body, { childList: true, subtree: true });
     document.addEventListener('visibilitychange', scheduleFarmTick);
@@ -962,6 +1011,9 @@
     status = document.createElement('span');
     status.textContent = '…';
     status.style.cssText = 'color:#8f8;font-size:12px;min-width:26px;flex-shrink:0;';
+    statsEl = document.createElement('span');
+    statsEl.style.cssText = 'color:#aee;font-size:11px;max-width:240px;white-space:normal;line-height:1.3;';
+    statsEl.textContent = 'Статистика появится после запуска';
 
     toggleBtn = mkBtn('▶ Бот', '#2a7d2a');
     var hintBtn = mkBtn('💡', '#555');
@@ -978,7 +1030,13 @@
       toggleBtn.style.background = running ? '#b8860b' : '#2a7d2a';
       status.textContent = running ? 'бот' : '⏸';
       status.style.color = running ? '#8f8' : '#fa0';
-      if (running && store) { rateStamp = { t: Date.now(), s: store.getState().game.score }; lastFarmSignature = ''; scheduleFarmTick(); }
+      if (running && store) {
+        var now = Date.now();
+        rateStamp = { t: now, s: store.getState().game.score };
+        farmStats = { started: now, stage: store.getState().game.stage, stageTime: now, levels: 0, solved: 0, lastSolved: now, lastTick: 0, longestGap: 0, waitingSince: 0, waitingMs: 0, lastStats: 0 };
+        lastFarmSignature = '';
+        scheduleFarmTick();
+      }
       if (running) showDelaySettings(); else closeSettingsPopup();
     };
     goalBtn.onclick = function () {
@@ -1106,6 +1164,7 @@
     makeDraggable(detEl, detEl);
     makeDraggable(eggEl, eggEl);
 
+    panel.appendChild(statsEl);
     document.body.appendChild(panel);
     document.body.appendChild(dot);
 

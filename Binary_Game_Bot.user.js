@@ -737,6 +737,19 @@
       var signature = g.stage + ':' + g.problemsCompleted + ':' + g.activeProblems.map(function (p) {
         return p.id + '=' + p.currentGuess + '/' + p.answer;
       }).join(',');
+      // Восстанавливаем генерацию строк, если после очистки доски игра зависла.
+      var pendingNow = store.getState().time.pendingActions;
+      if (!g.isIntro && !g.isGameOver && g.activeProblems.length === 0 &&
+          g.problemsCompleted < linesRequired(g.stage)) {
+        if ('add-problem' in pendingNow) {
+          // Приостановленные фоновые таймеры игры не должны блокировать очередь.
+          tryExecute('add-problem');
+        } else if (!farmStageStart) farmStageStart = Date.now();
+        else if (Date.now() - farmStageStart > 600) {
+          farmStageStart = 0;
+          beginStage();
+        }
+      } else farmStageStart = 0;
       if (signature === lastFarmSignature) return;
       lastFarmSignature = signature;
       g.activeProblems.slice().forEach(function (p) {
@@ -752,7 +765,6 @@
       if (!g.isIntro && !g.isGameOver && g.activeProblems.length === 0 &&
           g.problemsCompleted < linesRequired(g.stage) && !('add-problem' in pending)) {
         emptyTicks++;
-        if (emptyTicks > 5) { beginStage(); emptyTicks = 0; }
       } else emptyTicks = 0;
       farmTicks++;
     } catch (e) {

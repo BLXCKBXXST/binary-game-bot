@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Binary Game Bot
 // @namespace    https://netacad.sadlab.su/
-// @version      3.10
+// @version      3.11
 // @description  Автоматически проходит Cisco Binary Game
 // @match        https://netacad.sadlab.su/games/binary/*
 // @run-at       document-idle
@@ -50,7 +50,9 @@
 
   var store = null;
   var running = false;
-  var timer = null;
+  var timer = null, farmWorker = null, unsubscribeFarm = null, modalObserver = null;
+  var tickQueued = false, tickBusy = false, lastFarmSignature = '', lastFarmError = 0;
+  var lastModalAttempt = 0, farmTicks = 0, farmStageStart = 0;
   var panel = null, dot = null, status = null, toggleBtn = null, goalBtn = null;
   var hintOn = false, hintEl = null;
   var goalScore = 0;
@@ -63,7 +65,7 @@
   /* ---------- 2. Точная реплика таймерной очереди игры ---------- */
   function queue(action) {
     store.dispatch({ type: 'QUEUE_ACTION', payload: action });
-    setTimeout(function () { tryExecute(action.id); }, action.delay);
+    setTimeout(function () { tryExecute(action.id); scheduleFarmTick(); }, action.delay);
   }
   function tryExecute(actionID) {
     store.dispatch({ type: 'UPDATE_TIME' });
@@ -688,65 +690,100 @@
     return false;
   }
 
-  /* ---------- 6. Главный цикл ---------- */
+  /* ---------- 6. Фоновый фарм: события Redux + резервный Worker ---------- */
   var emptyTicks = 0;
+  function scheduleFarmTick() {
+    if (!running || !store || tickQueued || tickBusy) return;
+    tickQueued = true;
+    // Microtask не зависит от ограничений таймеров фоновых вкладок.
+    Promise.resolve().then(function () {
+      tickQueued = false;
+      farmTick();
+    });
+  }
+  function farmTick() {
+    if (!running || !store || tickBusy) return;
+    tickBusy = true;
+    try {
+      if (hintOn && document.visibilityState === 'visible') updateHint();
+      var g0 = store.getState().game;
+      if (g0.isGameOver && (goalScore || goalDone)) {
+        goalScore = 0;
+        goalDone = false;
+        if (goalBtn) goalBtn.style.background = '#555';
+      }
+      if (goalScore && g0.score >= goalScore) goalDone = true;
+      if (goalDone && !g0.isGameOver) {
+        clickModalButton('Next Level');
+        status.textContent = '🏁';
+        return;
+      }
+      var now0 = Date.now();
+      if (!rateStamp) rateStamp = { t: now0, s: g0.score };
+      if (now0 - rateStamp.t >= 3000 && !g0.isGameOver) {
+        var rate = Math.round((g0.score - rateStamp.s) / (now0 - rateStamp.t) * 60000);
+        rateStamp = { t: now0, s: g0.score };
+        status.textContent = rate >= 1000 ? Math.round(rate / 1000) + 'k/м' : rate + '/м';
+      }
+      // Модальные окна могут появляться до очередного обновления Redux.
+      if (now0 - lastModalAttempt > 300) {
+        lastModalAttempt = now0;
+        if (clickModalButton('Play Game') || clickModalButton('Next Level')) return;
+      }
+      if (document.querySelector('.modal-container.displayed')) return;
+      var g = store.getState().game;
+      if (g.isGameOver || g.isTutorial) return;
+      // Не перезапускаем решение на каждое внутреннее Redux-действие.
+      var signature = g.stage + ':' + g.problemsCompleted + ':' + g.activeProblems.map(function (p) {
+        return p.id + '=' + p.currentGuess + '/' + p.answer;
+      }).join(',');
+      if (signature === lastFarmSignature) return;
+      lastFarmSignature = signature;
+      g.activeProblems.slice().forEach(function (p) {
+        if (p.currentGuess !== p.answer) {
+          var gc = goalScore ? goalCheckSolve() : 0;
+          if (gc === 2) { goalDone = true; return; }
+          if (gc === 1) return;
+          solve(p);
+        }
+      });
+      g = store.getState().game;
+      var pending = store.getState().time.pendingActions;
+      if (!g.isIntro && !g.isGameOver && g.activeProblems.length === 0 &&
+          g.problemsCompleted < linesRequired(g.stage) && !('add-problem' in pending)) {
+        emptyTicks++;
+        if (emptyTicks > 5) { beginStage(); emptyTicks = 0; }
+      } else emptyTicks = 0;
+      farmTicks++;
+    } catch (e) {
+      if (Date.now() - lastFarmError > 5000) { console.log('bot error', e); lastFarmError = Date.now(); }
+    } finally { tickBusy = false; }
+  }
   function startLoop() {
+    if (typeof store.subscribe === 'function') {
+      unsubscribeFarm = store.subscribe(function () {
+        if (running) scheduleFarmTick();
+      });
+    }
+    // Worker обеспечивает резервные проверки, когда вкладка неактивна.
+    // Браузер всё равно может ограничивать Worker или полностью усыпить вкладку.
+    try {
+      var workerCode = 'var timer;onmessage=function(e){if(e.data===\"start\"){clearInterval(timer);timer=setInterval(function(){postMessage(\"tick\")},100)}else if(e.data===\"stop\"){clearInterval(timer);close()}}';
+      var workerURL = URL.createObjectURL(new Blob([workerCode], { type: 'text/javascript' }));
+      farmWorker = new Worker(workerURL);
+      URL.revokeObjectURL(workerURL);
+      farmWorker.onmessage = function () { farmTick(); };
+      farmWorker.postMessage('start');
+    } catch (e) { farmWorker = null; console.log('Worker недоступен; используется обычный таймер', e); }
     timer = setInterval(function () {
-      try {
-        if (hintOn && store) updateHint();
-        if (!running) return;
-
-        var g0 = store.getState().game;
-        if (g0.isGameOver && (goalScore || goalDone)) {
-          goalScore = 0;
-          goalDone = false;
-          if (goalBtn) goalBtn.style.background = '#555';
-        }
-        if (goalScore && g0.score >= goalScore) goalDone = true;
-        if (goalDone && !g0.isGameOver) {
-          /* Цель достигнута: не решаем — задачи копятся, игра сама закончится, рекорд запишется */
-          clickModalButton('Next Level');
-          status.textContent = '🏁';
-          return;
-        }
-
-        var now0 = Date.now();
-        if (!rateStamp) rateStamp = { t: now0, s: g0.score };
-        if (now0 - rateStamp.t >= 3000 && !g0.isGameOver) {
-          var rate = Math.round((g0.score - rateStamp.s) / (now0 - rateStamp.t) * 60000);
-          rateStamp = { t: now0, s: g0.score };
-          status.textContent = rate >= 1000 ? Math.round(rate / 1000) + 'k/м' : rate + '/м';
-        }
-
-        var modalHandled =
-          clickModalButton('Play Game') ||
-          clickModalButton('Next Level');
-        if (modalHandled) return;
-        if (document.querySelector('.modal-container.displayed')) return;
-
-        var g = store.getState().game;
-        if (g.isGameOver || g.isTutorial) return;
-
-        g.activeProblems.slice().forEach(function (p) {
-          if (p.currentGuess !== p.answer) {
-            var gc = goalScore ? goalCheckSolve() : 0;
-            if (gc === 2) { goalDone = true; return; }
-            if (gc === 1) return;
-            solve(p);
-          }
-        });
-
-        g = store.getState().game;
-        var pending = store.getState().time.pendingActions;
-        if (!g.isIntro && !g.isGameOver && g.activeProblems.length === 0 &&
-            g.problemsCompleted < linesRequired(g.stage) && !('add-problem' in pending)) {
-          emptyTicks++;
-          if (emptyTicks > 30) { beginStage(); emptyTicks = 0; }
-        } else {
-          emptyTicks = 0;
-        }
-      } catch (e) { console.log('bot error', e); }
-    }, FARM_DELAY);
+      if (running) farmTick();
+      else if (hintOn && document.visibilityState === 'visible') updateHint();
+    }, 250);
+    modalObserver = new MutationObserver(function () {
+      if (running) scheduleFarmTick();
+    });
+    modalObserver.observe(document.body, { childList: true, subtree: true });
+    document.addEventListener('visibilitychange', scheduleFarmTick);
   }
 
   /* ---------- 7. Панель управления ---------- */
@@ -929,7 +966,7 @@
       toggleBtn.style.background = running ? '#b8860b' : '#2a7d2a';
       status.textContent = running ? 'бот' : '⏸';
       status.style.color = running ? '#8f8' : '#fa0';
-      if (running && store) rateStamp = { t: Date.now(), s: store.getState().game.score };
+      if (running && store) { rateStamp = { t: Date.now(), s: store.getState().game.score }; lastFarmSignature = ''; scheduleFarmTick(); }
       if (running) showDelaySettings(); else closeSettingsPopup();
     };
     goalBtn.onclick = function () {
@@ -1069,6 +1106,10 @@
     closeSettingsPopup();
     running = false;
     if (timer) clearInterval(timer);
+    if (farmWorker) { farmWorker.postMessage('stop'); farmWorker.terminate(); farmWorker = null; }
+    if (unsubscribeFarm) { unsubscribeFarm(); unsubscribeFarm = null; }
+    if (modalObserver) { modalObserver.disconnect(); modalObserver = null; }
+    document.removeEventListener('visibilitychange', scheduleFarmTick);
     if (panel) panel.remove();
     if (dot) dot.remove();
     if (hintEl) hintEl.remove();
